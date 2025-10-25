@@ -32,6 +32,7 @@ contract XRouterPaymentHubAttestationFixed is ReentrancyGuard, Ownable {
         uint256 totalFee;
         uint256 requiredAttestations;
         uint256 timestamp;
+        uint256 submissionDeadline;  // Deadline for client submission
         bool settled;
         RequestStatus status;
     }
@@ -80,6 +81,8 @@ contract XRouterPaymentHubAttestationFixed is ReentrancyGuard, Ownable {
     uint256 public nonConsensusPenaltyPercent = 50;
     uint256 public minPoolDeposit = 10 ether;
     uint256 public requestTimeout = 5 minutes;
+    uint256 public clientSubmissionWindow = 5 minutes;  // Client has 5 min to submit
+    uint256 public nodeGasReimbursement = 0.01 ether;   // Per attestation gas reimbursement
 
     bool public paused = false;
 
@@ -96,6 +99,7 @@ contract XRouterPaymentHubAttestationFixed is ReentrancyGuard, Ownable {
     event PaymentDistributed(bytes32 indexed requestId, address indexed serviceNode, uint256 amount, bool consensusNode);
     event RequestExpired(bytes32 indexed requestId);
     event DisputeRaised(bytes32 indexed requestId, address indexed challenger, string reason);
+    event ClientPenalized(bytes32 indexed requestId, address indexed client, uint256 gasReimbursementAmount);
 
     // ============ Modifiers ============
 
@@ -199,10 +203,15 @@ contract XRouterPaymentHubAttestationFixed is ReentrancyGuard, Ownable {
         require(requiredAttestations > 0, "Need at least 1 attestation");
 
         uint256 totalFee = baseAttestationFee * requiredAttestations;
-        PaymentPool storage pool = paymentPools[msg.sender];
-        require(pool.balance - pool.reserved >= totalFee, "Insufficient pool balance");
 
-        pool.reserved += totalFee;
+        // Add gas reimbursement buffer (in case nodes must submit)
+        uint256 gasBuffer = nodeGasReimbursement * requiredAttestations;
+        uint256 totalReserved = totalFee + gasBuffer;
+
+        PaymentPool storage pool = paymentPools[msg.sender];
+        require(pool.balance - pool.reserved >= totalReserved, "Insufficient pool balance");
+
+        pool.reserved += totalReserved;
 
         requests[requestId] = Request({
             requestId: requestId,
@@ -210,6 +219,7 @@ contract XRouterPaymentHubAttestationFixed is ReentrancyGuard, Ownable {
             totalFee: totalFee,
             requiredAttestations: requiredAttestations,
             timestamp: block.timestamp,
+            submissionDeadline: block.timestamp + clientSubmissionWindow,
             settled: false,
             status: RequestStatus.PENDING
         });
@@ -218,6 +228,115 @@ contract XRouterPaymentHubAttestationFixed is ReentrancyGuard, Ownable {
         return true;
     }
 
+    /**
+     * @dev Client submits batch of attestations (preferred, no gas reimbursement)
+     * @param requestId Request identifier
+     * @param dataHashes Array of data hashes from nodes
+     * @param signatures Array of signatures from nodes
+     * @param nodeAddresses Array of node addresses
+     */
+    function submitBatchAttestations(
+        bytes32 requestId,
+        bytes32[] memory dataHashes,
+        bytes[] memory signatures,
+        address[] memory nodeAddresses
+    ) external nonReentrant {
+        Request storage request = requests[requestId];
+
+        require(msg.sender == request.client, "Not request owner");
+        require(!request.settled, "Already settled");
+        require(
+            block.timestamp <= request.submissionDeadline,
+            "Submission window closed"
+        );
+        require(
+            dataHashes.length == signatures.length &&
+            signatures.length == nodeAddresses.length,
+            "Array length mismatch"
+        );
+
+        // Verify and store each attestation
+        for (uint256 i = 0; i < nodeAddresses.length; i++) {
+            address nodeAddr = nodeAddresses[i];
+
+            require(serviceNodes[nodeAddr].registered, "Node not registered");
+            require(!hasAttested[requestId][nodeAddr], "Node already attested");
+
+            // Verify signature
+            bytes32 message = keccak256(abi.encodePacked(requestId, dataHashes[i]));
+            address signer = message.toEthSignedMessageHash().recover(signatures[i]);
+            require(signer == nodeAddr, "Invalid signature");
+
+            // Store attestation
+            requestAttestations[requestId].push(Attestation({
+                serviceNode: nodeAddr,
+                dataHash: dataHashes[i],
+                signature: signatures[i],
+                timestamp: block.timestamp,
+                verified: true
+            }));
+
+            hasAttested[requestId][nodeAddr] = true;
+            emit AttestationSubmitted(requestId, nodeAddr, dataHashes[i]);
+        }
+
+        request.status = RequestStatus.ATTESTING;
+
+        // Check if we have enough attestations for consensus
+        if (requestAttestations[requestId].length >= request.requiredAttestations) {
+            _processConsensusAndDistribute(requestId, false);  // false = no gas reimbursement
+        }
+    }
+
+    /**
+     * @dev Node submits attestation after deadline (with gas reimbursement)
+     */
+    function submitNodeAttestation(
+        bytes32 requestId,
+        bytes32 dataHash,
+        bytes memory signature
+    ) external nonReentrant onlyRegisteredNode {
+        Request storage request = requests[requestId];
+
+        require(!request.settled, "Already settled");
+        require(
+            block.timestamp > request.submissionDeadline,
+            "Client submission window still open"
+        );
+        require(
+            block.timestamp <= request.submissionDeadline + 1 hours,
+            "Too late, request expired"
+        );
+        require(!hasAttested[requestId][msg.sender], "Already attested");
+
+        // Verify signature
+        bytes32 message = keccak256(abi.encodePacked(requestId, dataHash));
+        address signer = message.toEthSignedMessageHash().recover(signature);
+        require(signer == msg.sender, "Invalid signature");
+
+        // Store attestation
+        requestAttestations[requestId].push(Attestation({
+            serviceNode: msg.sender,
+            dataHash: dataHash,
+            signature: signature,
+            timestamp: block.timestamp,
+            verified: true
+        }));
+
+        hasAttested[requestId][msg.sender] = true;
+        request.status = RequestStatus.ATTESTING;
+
+        emit AttestationSubmitted(requestId, msg.sender, dataHash);
+
+        // Check if we have enough
+        if (requestAttestations[requestId].length >= request.requiredAttestations) {
+            _processConsensusAndDistribute(requestId, true);  // true = reimburse gas
+        }
+    }
+
+    /**
+     * @dev Legacy single attestation submission (deprecated, kept for backward compatibility)
+     */
     function submitAttestation(bytes32 requestId, bytes32 dataHash, bytes memory signature) external nonReentrant onlyRegisteredNode {
         Request storage request = requests[requestId];
 
@@ -244,7 +363,7 @@ contract XRouterPaymentHubAttestationFixed is ReentrancyGuard, Ownable {
         emit AttestationSubmitted(requestId, msg.sender, dataHash);
 
         if (requestAttestations[requestId].length >= request.requiredAttestations) {
-            _processConsensusAndDistribute(requestId);
+            _processConsensusAndDistribute(requestId, false);
         }
     }
 
@@ -258,8 +377,11 @@ contract XRouterPaymentHubAttestationFixed is ReentrancyGuard, Ownable {
      *
      * Time Complexity: O(n) where n = number of attestations
      * Gas Cost: ~3,000-6,000 for typical requests
+     *
+     * @param requestId Request identifier
+     * @param reimburseGas Whether to reimburse gas costs (true if nodes submitted)
      */
-    function _processConsensusAndDistribute(bytes32 requestId) internal {
+    function _processConsensusAndDistribute(bytes32 requestId, bool reimburseGas) internal {
         Request storage request = requests[requestId];
         Attestation[] storage attestations = requestAttestations[requestId];
 
@@ -270,7 +392,7 @@ contract XRouterPaymentHubAttestationFixed is ReentrancyGuard, Ownable {
             bytes32 consensusHash = attestations[0].dataHash;
             request.status = RequestStatus.CONSENSUS_REACHED;
             emit ConsensusReached(requestId, consensusHash, 1);
-            _distributePayments(requestId, consensusHash);
+            _distributePayments(requestId, consensusHash, reimburseGas);
             return;
         }
 
@@ -315,18 +437,22 @@ contract XRouterPaymentHubAttestationFixed is ReentrancyGuard, Ownable {
         request.status = RequestStatus.CONSENSUS_REACHED;
         emit ConsensusReached(requestId, consensusHash, consensusCount);
 
-        _distributePayments(requestId, consensusHash);
+        _distributePayments(requestId, consensusHash, reimburseGas);
     }
 
     /**
-     * @dev Distribute payments to all attesting nodes
+     * @dev Distribute payments to all attesting nodes with optional gas reimbursement
+     * @param requestId Request identifier
+     * @param consensusHash The hash that achieved consensus
+     * @param reimburseGas Whether to reimburse gas costs to nodes
      */
-    function _distributePayments(bytes32 requestId, bytes32 consensusHash) internal {
+    function _distributePayments(bytes32 requestId, bytes32 consensusHash, bool reimburseGas) internal {
         Request storage request = requests[requestId];
         Attestation[] storage attestations = requestAttestations[requestId];
         PaymentPool storage pool = paymentPools[request.client];
 
         uint256 totalDistributed = 0;
+        uint256 totalGasReimbursement = 0;
 
         for (uint256 i = 0; i < attestations.length; i++) {
             address nodeAddr = attestations[i].serviceNode;
@@ -339,6 +465,12 @@ contract XRouterPaymentHubAttestationFixed is ReentrancyGuard, Ownable {
                 payment += (payment * consensusBonusPercent) / 100;
             } else {
                 payment -= (payment * nonConsensusPenaltyPercent) / 100;
+            }
+
+            // Add gas reimbursement if nodes had to submit
+            if (reimburseGas) {
+                payment += nodeGasReimbursement;
+                totalGasReimbursement += nodeGasReimbursement;
             }
 
             // Transfer payment
@@ -365,31 +497,53 @@ contract XRouterPaymentHubAttestationFixed is ReentrancyGuard, Ownable {
             emit PaymentDistributed(requestId, nodeAddr, payment, isConsensus);
         }
 
-        // Update pool
-        pool.reserved -= request.totalFee;
+        // Calculate total reserved amount (fee + gas buffer)
+        uint256 gasBuffer = nodeGasReimbursement * request.requiredAttestations;
+        uint256 totalReserved = request.totalFee + gasBuffer;
+
+        // Update pool (include gas reimbursement in cost)
+        pool.reserved -= totalReserved;
         pool.balance -= totalDistributed;
         pool.spent += totalDistributed;
         pool.nonce++;
 
         request.settled = true;
         request.status = RequestStatus.DISTRIBUTED;
+
+        // Penalize client if nodes had to submit
+        if (reimburseGas) {
+            emit ClientPenalized(requestId, request.client, totalGasReimbursement);
+        }
     }
 
+    /**
+     * @dev Finalize expired request (if no attestations at all or after full timeout)
+     */
     function finalizeExpiredRequest(bytes32 requestId) external nonReentrant {
         Request storage request = requests[requestId];
 
         require(request.client != address(0), "Request not found");
         require(!request.settled, "Already settled");
-        require(block.timestamp > request.timestamp + requestTimeout, "Not expired yet");
+        require(
+            block.timestamp > request.submissionDeadline + 1 hours,
+            "Not expired yet"
+        );
 
         PaymentPool storage pool = paymentPools[request.client];
 
-        if (requestAttestations[requestId].length < request.requiredAttestations) {
-            pool.reserved -= request.totalFee;
+        // Calculate total reserved (fee + gas buffer)
+        uint256 gasBuffer = nodeGasReimbursement * request.requiredAttestations;
+        uint256 totalReserved = request.totalFee + gasBuffer;
+
+        // If no attestations submitted, unreserve and mark expired
+        if (requestAttestations[requestId].length == 0) {
+            pool.reserved -= totalReserved;
             request.status = RequestStatus.EXPIRED;
+            request.settled = true;
             emit RequestExpired(requestId);
         } else {
-            _processConsensusAndDistribute(requestId);
+            // Process whatever attestations we have
+            _processConsensusAndDistribute(requestId, true);
         }
     }
 
@@ -399,15 +553,20 @@ contract XRouterPaymentHubAttestationFixed is ReentrancyGuard, Ownable {
             Request storage request = requests[requestId];
 
             if (request.client != address(0) && !request.settled &&
-                block.timestamp > request.timestamp + requestTimeout) {
+                block.timestamp > request.submissionDeadline + 1 hours) {
                 PaymentPool storage pool = paymentPools[request.client];
 
-                if (requestAttestations[requestId].length < request.requiredAttestations) {
-                    pool.reserved -= request.totalFee;
+                // Calculate total reserved (fee + gas buffer)
+                uint256 gasBuffer = nodeGasReimbursement * request.requiredAttestations;
+                uint256 totalReserved = request.totalFee + gasBuffer;
+
+                if (requestAttestations[requestId].length == 0) {
+                    pool.reserved -= totalReserved;
                     request.status = RequestStatus.EXPIRED;
+                    request.settled = true;
                     emit RequestExpired(requestId);
                 } else {
-                    _processConsensusAndDistribute(requestId);
+                    _processConsensusAndDistribute(requestId, true);
                 }
             }
         }
@@ -475,6 +634,14 @@ contract XRouterPaymentHubAttestationFixed is ReentrancyGuard, Ownable {
 
     function setRequestTimeout(uint256 timeout) external onlyOwner {
         requestTimeout = timeout;
+    }
+
+    function setClientSubmissionWindow(uint256 window) external onlyOwner {
+        clientSubmissionWindow = window;
+    }
+
+    function setNodeGasReimbursement(uint256 amount) external onlyOwner {
+        nodeGasReimbursement = amount;
     }
 
     function pause() external onlyOwner {
