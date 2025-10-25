@@ -1,0 +1,35 @@
+{
+  "name": "xrouter-payment-contracts",
+  "version": "1.0.0",
+  "description": "Payment channel smart contracts for XRouter",
+  "main": "index.js",
+  "scripts": {
+    "compile": "hardhat compile",
+    "test": "hardhat test",
+    "deploy:testnet": "hardhat run scripts/deploy.js --network goerli",
+    "deploy:mainnet": "hardhat run scripts/deploy.js --network mainnet",
+    "verify": "hardhat verify --network"
+  },
+  "keywords": [
+    "xrouter",
+    "payment-channels",
+    "blockchain"
+  ],
+  "author": "Blocknet",
+  "license": "MIT",
+  "devDependencies": {
+    "@nomicfoundation/hardhat-toolbox": "^2.0.0",
+    "@nomiclabs/hardhat-ethers": "^2.2.3",
+    "@nomiclabs/hardhat-etherscan": "^3.1.7",
+    "@openzeppelin/hardhat-upgrades": "^1.28.0",
+    "chai": "^4.3.7",
+    "ethereum-waffle": "^4.0.10",
+    "ethers": "^5.7.2",
+    "hardhat": "^2.14.0",
+    "hardhat-gas-reporter": "^1.0.9",
+    "solidity-coverage": "^0.8.2"
+  },
+  "dependencies": {
+    "@openzeppelin/contracts": "^4.9.0"
+  }
+}
